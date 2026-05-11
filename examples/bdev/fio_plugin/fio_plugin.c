@@ -67,9 +67,13 @@ struct spdk_fio_options {
 	void *pad;
 	char *conf;
 	char *json_conf;
+	char *rpc_addr;
 	char *log_flags;
+	char *iova_mode;
+	char *reactor_mask;
 	unsigned mem_mb;
 	int mem_single_seg;
+	int no_pci;
 	int initial_zone_reset;
 	int zone_append;
 };
@@ -116,6 +120,7 @@ struct spdk_fio_zone_cb_arg {
 
 static bool g_spdk_env_initialized = false;
 static const char *g_json_config_file = NULL;
+static const char *g_rpc_addr = SPDK_DEFAULT_RPC_ADDR;
 
 static int spdk_fio_init(struct thread_data *td);
 static void spdk_fio_cleanup(struct thread_data *td);
@@ -233,7 +238,7 @@ spdk_fio_bdev_init_start(void *arg)
 {
 	bool *done = arg;
 
-	spdk_subsystem_init_from_json_config(g_json_config_file, SPDK_DEFAULT_RPC_ADDR,
+	spdk_subsystem_init_from_json_config(g_json_config_file, g_rpc_addr,
 					     spdk_fio_bdev_init_done, done, true);
 }
 
@@ -249,6 +254,193 @@ spdk_fio_bdev_fini_start(void *arg)
 	bool *done = arg;
 
 	spdk_subsystem_fini(spdk_fio_bdev_fini_done, done);
+}
+
+static bool
+spdk_fio_exit_barrier_get(char *dir, size_t dir_size, int *id, int *count, int *timeout_sec)
+{
+	const char *env_dir = getenv("SEMIRAID_FIO_EXIT_BARRIER_DIR");
+	const char *env_id = getenv("SEMIRAID_FIO_EXIT_BARRIER_ID");
+	const char *env_count = getenv("SEMIRAID_FIO_EXIT_BARRIER_COUNT");
+	const char *env_timeout = getenv("SEMIRAID_FIO_EXIT_BARRIER_TIMEOUT");
+	char *end = NULL;
+	long value;
+
+	if (!env_dir || !env_id || !env_count || !strlen(env_dir)) {
+		return false;
+	}
+
+	value = strtol(env_id, &end, 10);
+	if (!end || *end != '\0' || value <= 0) {
+		return false;
+	}
+	*id = (int)value;
+
+	value = strtol(env_count, &end, 10);
+	if (!end || *end != '\0' || value <= 1) {
+		return false;
+	}
+	*count = (int)value;
+
+	*timeout_sec = 180;
+	if (env_timeout && strlen(env_timeout)) {
+		value = strtol(env_timeout, &end, 10);
+		if (end && *end == '\0' && value > 0) {
+			*timeout_sec = (int)value;
+		}
+	}
+
+	snprintf(dir, dir_size, "%s", env_dir);
+	return true;
+}
+
+static void
+spdk_fio_exit_barrier_touch(const char *dir, const char *prefix, int id)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/%s.%d", dir, prefix, id);
+	f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "%d\n", id);
+		fclose(f);
+	}
+}
+
+static bool
+spdk_fio_exit_barrier_exists(const char *dir, const char *prefix, int id)
+{
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "%s/%s.%d", dir, prefix, id);
+	return access(path, F_OK) == 0;
+}
+
+static void
+spdk_fio_exit_barrier_wait_for_turn(void)
+{
+	char dir[PATH_MAX];
+	int id, count, timeout_sec;
+	int elapsed, ready, i;
+
+	if (!spdk_fio_exit_barrier_get(dir, sizeof(dir), &id, &count, &timeout_sec)) {
+		return;
+	}
+
+	if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+		SPDK_WARNLOG("exit barrier mkdir failed for %s: %s\n", dir, strerror(errno));
+		return;
+	}
+
+	spdk_fio_exit_barrier_touch(dir, "ready", id);
+
+	for (elapsed = 0; elapsed < timeout_sec; elapsed++) {
+		ready = 0;
+		for (i = 1; i <= count; i++) {
+			if (spdk_fio_exit_barrier_exists(dir, "ready", i)) {
+				ready++;
+			}
+		}
+		if (ready >= count) {
+			break;
+		}
+		sleep(1);
+	}
+
+	if (id <= 1) {
+		return;
+	}
+
+	for (elapsed = 0; elapsed < timeout_sec; elapsed++) {
+		if (spdk_fio_exit_barrier_exists(dir, "cleaned", id - 1)) {
+			return;
+		}
+		sleep(1);
+	}
+
+	SPDK_WARNLOG("exit barrier timed out waiting for cleaned.%d\n", id - 1);
+}
+
+static void
+spdk_fio_exit_barrier_mark_cleaned(void)
+{
+	char dir[PATH_MAX];
+	int id, count, timeout_sec;
+
+	if (!spdk_fio_exit_barrier_get(dir, sizeof(dir), &id, &count, &timeout_sec)) {
+		return;
+	}
+
+	spdk_fio_exit_barrier_touch(dir, "cleaned", id);
+}
+
+static bool
+spdk_fio_start_barrier_wait(void)
+{
+	const char *env_dir = getenv("SEMIRAID_FIO_START_BARRIER_DIR");
+	const char *env_id = getenv("SEMIRAID_FIO_START_BARRIER_ID");
+	const char *env_count = getenv("SEMIRAID_FIO_START_BARRIER_COUNT");
+	const char *env_timeout = getenv("SEMIRAID_FIO_START_BARRIER_TIMEOUT");
+	char *end = NULL;
+	char ready_path[PATH_MAX], started_path[PATH_MAX], go_path[PATH_MAX];
+	long value;
+	int id, count, timeout_sec, elapsed_ms;
+	FILE *f;
+
+	if (!env_dir || !env_id || !env_count || !strlen(env_dir)) {
+		return true;
+	}
+
+	value = strtol(env_id, &end, 10);
+	if (!end || *end != '\0' || value <= 0) {
+		SPDK_WARNLOG("start barrier has invalid program id\n");
+		return false;
+	}
+	id = (int)value;
+
+	value = strtol(env_count, &end, 10);
+	if (!end || *end != '\0' || value <= 1) {
+		return true;
+	}
+	count = (int)value;
+
+	timeout_sec = 180;
+	if (env_timeout && strlen(env_timeout)) {
+		value = strtol(env_timeout, &end, 10);
+		if (end && *end == '\0' && value > 0) {
+			timeout_sec = (int)value;
+		}
+	}
+
+	if (mkdir(env_dir, 0777) != 0 && errno != EEXIST) {
+		SPDK_WARNLOG("start barrier mkdir failed for %s: %s\n", env_dir, strerror(errno));
+		return false;
+	}
+
+	snprintf(ready_path, sizeof(ready_path), "%s/ready.%d", env_dir, id);
+	f = fopen(ready_path, "w");
+	if (f) {
+		fprintf(f, "%d\n", id);
+		fclose(f);
+	}
+
+	snprintf(go_path, sizeof(go_path), "%s/go", env_dir);
+	for (elapsed_ms = 0; elapsed_ms < timeout_sec * 1000; elapsed_ms += 100) {
+		if (access(go_path, F_OK) == 0) {
+			snprintf(started_path, sizeof(started_path), "%s/started.%d", env_dir, id);
+			f = fopen(started_path, "w");
+			if (f) {
+				fprintf(f, "%d\n", id);
+				fclose(f);
+			}
+			return true;
+		}
+		usleep(100000);
+	}
+
+	SPDK_WARNLOG("start barrier timed out waiting for go after %d seconds\n", timeout_sec);
+	return false;
 }
 
 static void *
@@ -283,6 +475,9 @@ spdk_init_thread_poll(void *arg)
 		rc = EINVAL;
 		goto err_exit;
 	}
+	if (eo->rpc_addr && strlen(eo->rpc_addr)) {
+		g_rpc_addr = eo->rpc_addr;
+	}
 
 	/* Initialize the environment library */
 	spdk_env_opts_init(&opts);
@@ -292,6 +487,13 @@ spdk_init_thread_poll(void *arg)
 		opts.mem_size = eo->mem_mb;
 	}
 	opts.hugepage_single_segments = eo->mem_single_seg;
+	opts.no_pci = eo->no_pci;
+	if (eo->iova_mode && strlen(eo->iova_mode)) {
+		opts.iova_mode = eo->iova_mode;
+	}
+	if (eo->reactor_mask && strlen(eo->reactor_mask)) {
+		opts.core_mask = eo->reactor_mask;
+	}
 
 	if (spdk_env_init(&opts) < 0) {
 		SPDK_ERRLOG("Unable to initialize SPDK env\n");
@@ -347,7 +549,7 @@ spdk_init_thread_poll(void *arg)
 	pthread_mutex_unlock(&g_init_mtx);
 
     /* Enable RPC server for spdk_iostat */
-    spdk_rpc_initialize(SPDK_DEFAULT_RPC_ADDR);
+    spdk_rpc_initialize(g_rpc_addr);
     spdk_rpc_set_state(SPDK_RPC_RUNTIME);
 
 	while (g_poll_loop) {
@@ -377,6 +579,8 @@ spdk_init_thread_poll(void *arg)
 
 
 	}
+
+	spdk_fio_exit_barrier_wait_for_turn();
 
     spdk_rpc_finish();
 
@@ -414,6 +618,8 @@ spdk_init_thread_poll(void *arg)
 			}
 		}
 	}
+
+	spdk_fio_exit_barrier_mark_cleaned();
 
 	pthread_exit(NULL);
 
@@ -665,6 +871,9 @@ spdk_fio_init(struct thread_data *td)
 	while (spdk_fio_poll_thread(fio_thread) > 0) {}
 
 	if (fio_thread->failed) {
+		return -1;
+	}
+	if (!spdk_fio_start_barrier_wait()) {
 		return -1;
 	}
 
@@ -1220,6 +1429,15 @@ static struct fio_option options[] = {
 		.group          = FIO_OPT_G_INVALID,
 	},
 	{
+		.name           = "spdk_rpc_addr",
+		.lname          = "SPDK RPC socket path",
+		.type           = FIO_OPT_STR_STORE,
+		.off1           = offsetof(struct spdk_fio_options, rpc_addr),
+		.help           = "SPDK RPC socket path",
+		.category       = FIO_OPT_C_ENGINE,
+		.group          = FIO_OPT_G_INVALID,
+	},
+	{
 		.name		= "spdk_mem",
 		.lname		= "SPDK memory in MB",
 		.type		= FIO_OPT_INT,
@@ -1235,6 +1453,34 @@ static struct fio_option options[] = {
 		.off1		= offsetof(struct spdk_fio_options, mem_single_seg),
 		.help		= "If set to 1, SPDK will use just a single hugetlbfs file",
 		.def            = "0",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "spdk_no_pci",
+		.lname		= "SPDK no PCI probe",
+		.type		= FIO_OPT_BOOL,
+		.off1		= offsetof(struct spdk_fio_options, no_pci),
+		.help		= "If set to 1, SPDK will not probe local PCI devices",
+		.def		= "0",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "spdk_iova_mode",
+		.lname		= "SPDK IOVA mode",
+		.type		= FIO_OPT_STR_STORE,
+		.off1		= offsetof(struct spdk_fio_options, iova_mode),
+		.help		= "DPDK IOVA mode, usually pa or va",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "spdk_reactor_mask",
+		.lname		= "SPDK reactor core mask",
+		.type		= FIO_OPT_STR_STORE,
+		.off1		= offsetof(struct spdk_fio_options, reactor_mask),
+		.help		= "SPDK env core mask",
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_INVALID,
 	},
