@@ -72,6 +72,8 @@ struct spdk_fio_options {
 	char *iova_mode;
 	char *reactor_mask;
 	unsigned mem_mb;
+	unsigned bdev_io_pool_size;
+	unsigned bdev_io_cache_size;
 	int mem_single_seg;
 	int no_pci;
 	int initial_zone_reset;
@@ -128,12 +130,15 @@ static size_t spdk_fio_poll_thread(struct spdk_fio_thread *fio_thread);
 static int spdk_fio_handle_options(struct thread_data *td, struct fio_file *f,
 				   struct spdk_bdev *bdev);
 static int spdk_fio_handle_options_per_target(struct thread_data *td, struct fio_file *f);
+static bool spdk_fio_exit_barrier_get(char *dir, size_t dir_size, int *id,
+				      int *count, int *timeout_sec);
 
 static pthread_t g_init_thread_id = 0;
 static pthread_mutex_t g_init_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_init_cond;
 static bool g_poll_loop = true;
 static TAILQ_HEAD(, spdk_fio_thread) g_threads = TAILQ_HEAD_INITIALIZER(g_threads);
+static TAILQ_HEAD(, spdk_fio_thread) g_deferred_cleanup_threads = TAILQ_HEAD_INITIALIZER(g_deferred_cleanup_threads);
 
 /* Default polling timeout (ns) */
 #define SPDK_FIO_POLLING_TIMEOUT 1000000000ULL
@@ -190,6 +195,39 @@ spdk_fio_cleanup_thread(struct spdk_fio_thread *fio_thread)
 
 	pthread_mutex_lock(&g_init_mtx);
 	TAILQ_INSERT_TAIL(&g_threads, fio_thread, link);
+	pthread_mutex_unlock(&g_init_mtx);
+}
+
+static bool
+spdk_fio_multigroup_exit_barrier_enabled(void)
+{
+	char dir[PATH_MAX];
+	int id, count, timeout_sec;
+
+	return spdk_fio_exit_barrier_get(dir, sizeof(dir), &id, &count, &timeout_sec) &&
+	       count > 1;
+}
+
+static void
+spdk_fio_defer_cleanup_thread(struct spdk_fio_thread *fio_thread)
+{
+	pthread_mutex_lock(&g_init_mtx);
+	TAILQ_INSERT_TAIL(&g_deferred_cleanup_threads, fio_thread, link);
+	pthread_cond_signal(&g_init_cond);
+	pthread_mutex_unlock(&g_init_mtx);
+}
+
+static void
+spdk_fio_flush_deferred_cleanup_threads(void)
+{
+	struct spdk_fio_thread *thread, *tmp;
+
+	pthread_mutex_lock(&g_init_mtx);
+	TAILQ_FOREACH_SAFE(thread, &g_deferred_cleanup_threads, link, tmp) {
+		TAILQ_REMOVE(&g_deferred_cleanup_threads, thread, link);
+		spdk_thread_send_msg(thread->thread, spdk_fio_bdev_close_targets, thread);
+		TAILQ_INSERT_TAIL(&g_threads, thread, link);
+	}
 	pthread_mutex_unlock(&g_init_mtx);
 }
 
@@ -257,6 +295,32 @@ spdk_fio_bdev_fini_start(void *arg)
 }
 
 static bool
+semiraid_fio_skip_spdk_finish_env(void)
+{
+	const char *env = getenv("SEMIRAID_FIO_SKIP_SPDK_FINISH_ENV");
+
+	return env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "yes") == 0);
+}
+
+static void
+semiraid_fio_post_run_hold(void)
+{
+	const char *hold_str = getenv("SEMIRAID_FIO_POST_RUN_HOLD_SEC");
+	char *end = NULL;
+	long hold_sec;
+
+	if (!hold_str || !strlen(hold_str)) {
+		return;
+	}
+	hold_sec = strtol(hold_str, &end, 10);
+	if (!end || *end != '\0' || hold_sec <= 0) {
+		return;
+	}
+	SPDK_NOTICELOG("SemiRAID fio post-run hold %ld seconds before SPDK cleanup\n", hold_sec);
+sleep((unsigned int)hold_sec);
+}
+
+static bool
 spdk_fio_exit_barrier_get(char *dir, size_t dir_size, int *id, int *count, int *timeout_sec)
 {
 	const char *env_dir = getenv("SEMIRAID_FIO_EXIT_BARRIER_DIR");
@@ -317,6 +381,31 @@ spdk_fio_exit_barrier_exists(const char *dir, const char *prefix, int id)
 	return access(path, F_OK) == 0;
 }
 
+static bool
+spdk_fio_exit_barrier_release_enabled(void)
+{
+	const char *env = getenv("SEMIRAID_FIO_EXIT_BARRIER_RELEASE_ENABLE");
+
+	return env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0 || strcmp(env, "yes") == 0);
+}
+
+static void
+spdk_fio_exit_barrier_wait_for_release(const char *dir, int timeout_sec)
+{
+	char path[PATH_MAX];
+	int elapsed;
+
+	snprintf(path, sizeof(path), "%s/release", dir);
+	for (elapsed = 0; elapsed < timeout_sec; elapsed++) {
+		if (access(path, F_OK) == 0) {
+			return;
+		}
+		sleep(1);
+	}
+
+	SPDK_WARNLOG("exit barrier timed out waiting for release\n");
+}
+
 static void
 spdk_fio_exit_barrier_wait_for_turn(void)
 {
@@ -346,6 +435,10 @@ spdk_fio_exit_barrier_wait_for_turn(void)
 			break;
 		}
 		sleep(1);
+	}
+
+	if (spdk_fio_exit_barrier_release_enabled()) {
+		spdk_fio_exit_barrier_wait_for_release(dir, timeout_sec);
 	}
 
 	if (id <= 1) {
@@ -519,6 +612,23 @@ spdk_init_thread_poll(void *arg)
 
 	spdk_thread_lib_init(NULL, 0);
 
+	if (eo->bdev_io_pool_size || eo->bdev_io_cache_size) {
+		struct spdk_bdev_opts bdev_opts;
+
+		spdk_bdev_get_opts(&bdev_opts, sizeof(bdev_opts));
+		if (eo->bdev_io_pool_size) {
+			bdev_opts.bdev_io_pool_size = eo->bdev_io_pool_size;
+		}
+		if (eo->bdev_io_cache_size) {
+			bdev_opts.bdev_io_cache_size = eo->bdev_io_cache_size;
+		}
+		if (spdk_bdev_set_opts(&bdev_opts)) {
+			SPDK_ERRLOG("Unable to set bdev options\n");
+			rc = EINVAL;
+			goto err_exit;
+		}
+	}
+
 	/* Create an SPDK thread temporarily */
 	rc = spdk_fio_init_thread(&td);
 	if (rc < 0) {
@@ -581,6 +691,7 @@ spdk_init_thread_poll(void *arg)
 	}
 
 	spdk_fio_exit_barrier_wait_for_turn();
+	spdk_fio_flush_deferred_cleanup_threads();
 
     spdk_rpc_finish();
 
@@ -885,8 +996,18 @@ spdk_fio_cleanup(struct thread_data *td)
 {
 	struct spdk_fio_thread *fio_thread = td->io_ops_data;
 
+	if (semiraid_fio_skip_spdk_finish_env()) {
+		/* skip SPDK cleanup drain on process-exit cleanup; fio has already completed the measured jobs. */
+		/* skip SPDK bdev target close on process-exit cleanup; process teardown releases OS resources. */
+		td->io_ops_data = NULL;
+		return;
+	}
 	spdk_fio_drain_thread(fio_thread);
-	spdk_fio_cleanup_thread(fio_thread);
+	if (spdk_fio_multigroup_exit_barrier_enabled()) {
+		spdk_fio_defer_cleanup_thread(fio_thread);
+	} else {
+		spdk_fio_cleanup_thread(fio_thread);
+	}
 	td->io_ops_data = NULL;
 }
 
@@ -1457,6 +1578,24 @@ static struct fio_option options[] = {
 		.group		= FIO_OPT_G_INVALID,
 	},
 	{
+		.name		= "spdk_bdev_io_pool_size",
+		.lname		= "SPDK bdev I/O pool size",
+		.type		= FIO_OPT_INT,
+		.off1		= offsetof(struct spdk_fio_options, bdev_io_pool_size),
+		.help		= "Number of spdk_bdev_io objects in the global bdev pool",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
+		.name		= "spdk_bdev_io_cache_size",
+		.lname		= "SPDK bdev I/O cache size",
+		.type		= FIO_OPT_INT,
+		.off1		= offsetof(struct spdk_fio_options, bdev_io_cache_size),
+		.help		= "Per-thread spdk_bdev_io cache size",
+		.category	= FIO_OPT_C_ENGINE,
+		.group		= FIO_OPT_G_INVALID,
+	},
+	{
 		.name		= "spdk_no_pci",
 		.lname		= "SPDK no PCI probe",
 		.type		= FIO_OPT_BOOL,
@@ -1575,7 +1714,10 @@ spdk_fio_finish_env(void)
 static void fio_exit spdk_fio_unregister(void)
 {
 	if (g_spdk_env_initialized) {
-		spdk_fio_finish_env();
+		semiraid_fio_post_run_hold();
+		if (!semiraid_fio_skip_spdk_finish_env()) {
+			spdk_fio_finish_env();
+		}
 		g_spdk_env_initialized = false;
 	}
 	unregister_ioengine(&ioengine);
