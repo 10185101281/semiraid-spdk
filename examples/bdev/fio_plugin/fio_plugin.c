@@ -44,6 +44,9 @@
 #include "spdk/queue.h"
 #include "spdk/util.h"
 #include "spdk/rpc.h"
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+#include "semiraid_latency_breakdown.h"
+#endif
 
 #include "spdk_internal/event.h"
 
@@ -987,6 +990,9 @@ spdk_fio_init(struct thread_data *td)
 	if (!spdk_fio_start_barrier_wait()) {
 		return -1;
 	}
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	semiraid_lb_measurement_begin();
+#endif
 
 	return 0;
 }
@@ -996,6 +1002,10 @@ spdk_fio_cleanup(struct thread_data *td)
 {
 	struct spdk_fio_thread *fio_thread = td->io_ops_data;
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	semiraid_lb_measurement_end();
+	(void)semiraid_lb_export();
+#endif
 	if (semiraid_fio_skip_spdk_finish_env()) {
 		/* skip SPDK cleanup drain on process-exit cleanup; fio has already completed the measured jobs. */
 		/* skip SPDK bdev target close on process-exit cleanup; process teardown releases OS resources. */
