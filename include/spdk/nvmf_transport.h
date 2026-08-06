@@ -121,6 +121,7 @@ struct spdk_nvmf_request {
 #if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
 	uint64_t			latency_breakdown_correlation_id;
 	uint64_t			latency_breakdown_receive_ticks;
+	uint64_t			latency_breakdown_predispatch_background_ticks;
 	uint8_t			latency_breakdown_operation;
 #endif
 
