@@ -42,11 +42,37 @@
 #include "spdk/likely.h"
 #include "spdk/nvme.h"
 #include "spdk/nvmf_cmd.h"
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+#include "spdk/nvmf_breakdown.h"
+#endif
 #include "spdk/nvmf_spec.h"
 #include "spdk/trace.h"
 #include "spdk/scsi_spec.h"
 #include "spdk/string.h"
 #include "spdk/util.h"
+
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+static __thread struct spdk_nvmf_request *g_nvmf_breakdown_current_request;
+
+uint64_t
+spdk_nvmf_breakdown_current_correlation(void)
+{
+	return g_nvmf_breakdown_current_request == NULL ? 0 :
+	       g_nvmf_breakdown_current_request->latency_breakdown_correlation_id;
+}
+
+static void
+nvmf_breakdown_enter_request(struct spdk_nvmf_request *req)
+{
+	g_nvmf_breakdown_current_request = req;
+}
+
+static void
+nvmf_breakdown_leave_request(void)
+{
+	g_nvmf_breakdown_current_request = NULL;
+}
+#endif
 
 #include "spdk/log.h"
 
@@ -313,8 +339,14 @@ nvmf_bdev_ctrlr_read_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_using_zcopy(req->zcopy_phase));
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	nvmf_breakdown_enter_request(req);
+#endif
 	rc = spdk_bdev_readv_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				    nvmf_bdev_ctrlr_complete_cmd, req);
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	nvmf_breakdown_leave_request();
+#endif
 	if (spdk_unlikely(rc)) {
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);
@@ -364,8 +396,14 @@ nvmf_bdev_ctrlr_write_cmd(struct spdk_bdev *bdev, struct spdk_bdev_desc *desc,
 
 	assert(!spdk_nvmf_using_zcopy(req->zcopy_phase));
 
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	nvmf_breakdown_enter_request(req);
+#endif
 	rc = spdk_bdev_writev_blocks(desc, ch, req->iov, req->iovcnt, start_lba, num_blocks,
 				     nvmf_bdev_ctrlr_complete_cmd, req);
+#if defined(SEMIRAID_ENABLE_LATENCY_BREAKDOWN)
+	nvmf_breakdown_leave_request();
+#endif
 	if (spdk_unlikely(rc)) {
 		if (rc == -ENOMEM) {
 			nvmf_bdev_ctrl_queue_io(req, bdev, ch, nvmf_ctrlr_process_io_cmd_resubmit, req);

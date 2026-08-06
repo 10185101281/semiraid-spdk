@@ -116,6 +116,7 @@
 	spdk_nvmf_ctrlr_get_id;
 	spdk_nvmf_req_get_xfer;
 	spdk_nvmf_poll_group_remove;
+	spdk_nvmf_breakdown_current_correlation;
 
 
 	local: *;
