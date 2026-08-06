@@ -326,6 +326,14 @@ spdk_thread_lib_init_ext(spdk_thread_op_fn thread_op_fn,
 	return _thread_lib_init(ctx_sz);
 }
 
+bool
+spdk_thread_lib_is_scheduler_managed(void)
+{
+	return g_new_thread_fn != NULL ||
+	       (g_thread_op_supported_fn != NULL &&
+		g_thread_op_supported_fn(SPDK_THREAD_OP_NEW));
+}
+
 void
 spdk_thread_lib_fini(void)
 {

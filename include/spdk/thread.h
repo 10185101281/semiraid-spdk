@@ -244,6 +244,18 @@ int spdk_thread_lib_init_ext(spdk_thread_op_fn thread_op_fn,
 			     size_t ctx_sz);
 
 /**
+ * Return whether newly created SPDK threads are assigned to a framework
+ * scheduler that owns their polling.
+ *
+ * Embedders that initialize the thread library without a NEW-thread callback
+ * must poll every thread they create themselves.
+ *
+ * \return true if the registered thread framework supports NEW-thread
+ * scheduling; otherwise false.
+ */
+bool spdk_thread_lib_is_scheduler_managed(void);
+
+/**
  * Release all resources associated with this library.
  */
 void spdk_thread_lib_fini(void);

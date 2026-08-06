@@ -77,6 +77,7 @@ thread_alloc(void)
 
 	/* No schedule callback */
 	spdk_thread_lib_init(NULL, 0);
+	SPDK_CU_ASSERT_FATAL(spdk_thread_lib_is_scheduler_managed() == false);
 	thread = spdk_thread_create(NULL, NULL);
 	SPDK_CU_ASSERT_FATAL(thread != NULL);
 	spdk_set_thread(thread);
@@ -89,6 +90,7 @@ thread_alloc(void)
 
 	/* Schedule callback exists */
 	spdk_thread_lib_init(_thread_schedule, 0);
+	SPDK_CU_ASSERT_FATAL(spdk_thread_lib_is_scheduler_managed() == true);
 
 	/* Scheduling succeeds */
 	g_sched_rc = 0;
@@ -110,6 +112,7 @@ thread_alloc(void)
 
 	/* Scheduling callback exists with extended thread library initialization. */
 	spdk_thread_lib_init_ext(_thread_op, _thread_op_supported, 0);
+	SPDK_CU_ASSERT_FATAL(spdk_thread_lib_is_scheduler_managed() == true);
 
 	/* Scheduling succeeds */
 	g_sched_rc = 0;
